@@ -11,7 +11,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -95,6 +97,7 @@ def main() -> None:
     )
     parser.add_argument("--max-output-tokens", type=int, default=16384)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--workers", type=int, default=1)
     args = parser.parse_args()
 
     grader = ResponsesTextSampler(
@@ -118,23 +121,31 @@ def main() -> None:
         "grader_model": args.grader_model,
         "examples": args.examples,
         "sample_seed": 0,
+        "workers": args.workers,
         "started_at": datetime.now(UTC).isoformat(),
         "results": [],
     }
     _write_results(args.output, payload)
 
-    for index, row in enumerate(evaluation.examples):
+    lock = threading.Lock()
+    completed = 0
+
+    def handle(index: int, row: dict[str, Any]) -> None:
+        nonlocal completed
         problem = decrypt(row["problem"], row["canary"])
         answer = decrypt(row["answer"], row["canary"])
         question_hash = hashlib.sha256(problem.encode()).hexdigest()
 
+        error: str | None = None
+        grade: str | None = None
+        response_text: str | None = None
+        response_metadata: dict[str, Any] = {}
         if args.mode == "oracle":
             response_text = (
                 "Explanation: Oracle reference answer supplied to validate the grader.\n"
                 f"Exact Answer: {answer}\n"
                 "Confidence: 100%"
             )
-            response_metadata: dict[str, Any] = {}
         else:
             messages: MessageList = [
                 {
@@ -149,25 +160,50 @@ def main() -> None:
                     "content": QUERY_TEMPLATE.format(Question=problem),
                 },
             ]
-            sampled = agent(messages)
-            response_text = sampled.response_text
-            response_metadata = sampled.response_metadata
+            try:
+                sampled = agent(messages)
+                response_text = sampled.response_text
+                response_metadata = sampled.response_metadata
+            except Exception as exc:  # sampler already retried transient errors
+                error = str(exc)
 
-        grade = evaluation.grade_sample(problem, answer, response_text)
+        if error is None:
+            grade = evaluation.grade_sample(problem, answer, response_text)
         result = {
             "sample_index": index,
             "question_sha256": question_hash,
-            "score": grade.strip().lower() in {"yes", "correct: yes"},
+            "score": (
+                grade.strip().lower() in {"yes", "correct: yes"}
+                if grade is not None
+                else None
+            ),
             "grade": grade,
+            "error": error,
             "response": response_text if args.mode == "agent" else None,
             "response_metadata": response_metadata,
         }
-        payload["results"].append(result)
-        payload["accuracy"] = sum(item["score"] for item in payload["results"]) / len(
-            payload["results"]
-        )
-        _write_results(args.output, payload)
-        print(f"sample {index + 1}/{args.examples}: {grade}", flush=True)
+        with lock:
+            completed += 1
+            payload["results"].append(result)
+            payload["results"].sort(key=lambda item: item["sample_index"])
+            # Errored samples carry score=None and are excluded from accuracy;
+            # rerun them rather than counting infra failures as wrong answers.
+            scored = [item for item in payload["results"] if item["score"] is not None]
+            payload["accuracy"] = (
+                sum(item["score"] for item in scored) / len(scored) if scored else 0.0
+            )
+            payload["error_count"] = len(payload["results"]) - len(scored)
+            _write_results(args.output, payload)
+            label = grade if error is None else f"ERROR: {error[:120]}"
+            print(f"sample {completed}/{args.examples}: {label}", flush=True)
+
+    with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
+        futures = [
+            pool.submit(handle, index, row)
+            for index, row in enumerate(evaluation.examples)
+        ]
+        for future in as_completed(futures):
+            future.result()
 
     payload["completed_at"] = datetime.now(UTC).isoformat()
     _write_results(args.output, payload)
