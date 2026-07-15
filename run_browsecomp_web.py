@@ -98,6 +98,14 @@ def main() -> None:
     parser.add_argument("--max-output-tokens", type=int, default=16384)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument(
+        "--only-indices",
+        default=None,
+        help=(
+            "Comma-separated sample indices to run, relative to the seeded "
+            "--examples sample (e.g. rerun errored samples from a prior run)"
+        ),
+    )
     args = parser.parse_args()
 
     grader = ResponsesTextSampler(
@@ -126,6 +134,14 @@ def main() -> None:
         "results": [],
     }
     _write_results(args.output, payload)
+
+    selected = list(enumerate(evaluation.examples))
+    if args.only_indices:
+        only = {int(part) for part in args.only_indices.split(",") if part.strip()}
+        selected = [(index, row) for index, row in selected if index in only]
+        payload["only_indices"] = sorted(only)
+        _write_results(args.output, payload)
+    total = len(selected)
 
     lock = threading.Lock()
     completed = 0
@@ -195,13 +211,10 @@ def main() -> None:
             payload["error_count"] = len(payload["results"]) - len(scored)
             _write_results(args.output, payload)
             label = grade if error is None else f"ERROR: {error[:120]}"
-            print(f"sample {completed}/{args.examples}: {label}", flush=True)
+            print(f"sample {completed}/{total}: {label}", flush=True)
 
     with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
-        futures = [
-            pool.submit(handle, index, row)
-            for index, row in enumerate(evaluation.examples)
-        ]
+        futures = [pool.submit(handle, index, row) for index, row in selected]
         for future in as_completed(futures):
             future.result()
 
